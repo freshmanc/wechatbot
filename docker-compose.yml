@@ -1,0 +1,66 @@
+version: "3.8"
+
+services:
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://wxbot:wxbot_secret@postgres:5432/wxbot
+      - REDIS_URL=redis://redis:6379/0
+      - WECOM_CORP_ID=${WECOM_CORP_ID}
+      - WECOM_AGENT_ID=${WECOM_AGENT_ID}
+      - WECOM_SECRET=${WECOM_SECRET}
+      - WECOM_TOKEN=${WECOM_TOKEN}
+      - WECOM_AES_KEY=${WECOM_AES_KEY}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    volumes:
+      - ./data:/app/data:ro
+    restart: unless-stopped
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: wxbot
+      POSTGRES_PASSWORD: wxbot_secret
+      POSTGRES_DB: wxbot
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wxbot -d wxbot"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  # 可选：异步入库任务
+  # worker:
+  #   build:
+  #     context: ./backend
+  #     dockerfile: Dockerfile
+  #   command: python -m app.worker
+  #   environment:
+  #     - DATABASE_URL=postgresql://wxbot:wxbot_secret@postgres:5432/wxbot
+  #     - REDIS_URL=redis://redis:6379/0
+  #   depends_on:
+  #     - postgres
+  #     - redis
+
+volumes:
+  postgres_data:
+  redis_data:

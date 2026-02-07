@@ -1,0 +1,2 @@
+# Run: alembic revision --autogenerate -m "init"
+# Then: alembic upgrade head

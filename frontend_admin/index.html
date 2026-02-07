@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>管理后台 - 企业微信问答机器人</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, "Segoe UI", sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
+    nav { margin-bottom: 24px; }
+    nav a { margin-right: 16px; color: #1890ff; text-decoration: none; }
+    nav a:hover { text-decoration: underline; }
+    .card { background: #fff; border-radius: 8px; padding: 20px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+    h1 { margin: 0 0 8px 0; font-size: 20px; }
+    .muted { color: #666; font-size: 14px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid #eee; }
+    th { font-weight: 600; color: #333; }
+    .empty { color: #999; padding: 24px; text-align: center; }
+    input[type="number"], select { padding: 8px 12px; border: 1px solid #ddd; border-radius: 4px; }
+    button { padding: 8px 16px; background: #1890ff; color: #fff; border: none; border-radius: 4px; cursor: pointer; }
+    button:hover { background: #40a9ff; }
+    button.secondary { background: #fff; color: #1890ff; border: 1px solid #1890ff; }
+  </style>
+</head>
+<body>
+  <nav>
+    <a href="index.html">首页 / 限额</a>
+    <a href="knowledge.html">知识管理</a>
+  </nav>
+  <div class="card">
+    <h1>限额配置</h1>
+    <p class="muted">每日请求上限（用户 / 群 / 全局）</p>
+    <div style="margin-top: 16px;">
+      <label>用户每日: <input type="number" id="user_daily" min="1" value="50" /> 次</label><br style="margin-bottom:8px" />
+      <label>群每日: <input type="number" id="group_daily" min="1" value="200" /> 次</label><br style="margin-bottom:8px" />
+      <label>全局每日: <input type="number" id="global_daily" min="1" value="10000" /> 次</label><br style="margin-top:12px" />
+      <button id="fetch_limits">读取当前</button>
+      <button id="save_limits" class="secondary">保存（占位）</button>
+    </div>
+    <div id="limits_msg" class="muted" style="margin-top: 12px;"></div>
+  </div>
+  <div class="card">
+    <h1>最近日志</h1>
+    <p class="muted">问答记录（占位，需接 API）</p>
+    <div id="logs_list"><p class="empty">暂无数据。请配置后端 API 地址并接入 /admin/logs。</p></div>
+  </div>
+  <script>
+    const API_BASE = (window.location.port === '5500' || window.location.port === '3000')
+      ? 'http://localhost:8000' : '';
+    document.getElementById('fetch_limits').onclick = async () => {
+      const msg = document.getElementById('limits_msg');
+      try {
+        const r = await fetch(API_BASE + '/admin/limits');
+        const d = await r.json();
+        document.getElementById('user_daily').value = d.user_daily ?? 50;
+        document.getElementById('group_daily').value = d.group_daily ?? 200;
+        document.getElementById('global_daily').value = d.global_daily ?? 10000;
+        msg.textContent = '已从服务端读取。';
+      } catch (e) {
+        msg.textContent = '请求失败: ' + e.message;
+      }
+    };
+    document.getElementById('save_limits').onclick = () => {
+      document.getElementById('limits_msg').textContent = '保存为占位接口，实际需接 PATCH /admin/limits。';
+    };
+  </script>
+</body>
+</html>
