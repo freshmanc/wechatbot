@@ -3,6 +3,7 @@
 自建应用发群消息：先获取 access_token，再调「应用推送消息到群聊」接口。
 文档：https://developer.work.weixin.qq.com/document/path/90248
 """
+import asyncio
 import time
 from typing import Optional
 
@@ -14,7 +15,7 @@ from app.config import get_settings
 _token_cache: dict[str, tuple[float, str]] = {}
 
 
-def _get_access_token() -> str:
+def _get_access_token_sync() -> str:
     """获取企业微信 access_token（带简单内存缓存）。"""
     s = get_settings()
     key = f"{s.wecom_corp_id}_{s.wecom_agent_id}"
@@ -38,14 +39,18 @@ def _get_access_token() -> str:
     return token
 
 
-def send_group_text(chat_id: str, content: str, mentioned_list: Optional[list[str]] = None) -> dict:
-    """
-    应用推送文本消息到群聊。
-    chat_id: 群聊 ID（从回调 ChatId 获取）
-    content: 文本内容
-    mentioned_list: 要 @ 的成员 userid 列表，可选
-    """
-    token = _get_access_token()
+def _get_access_token() -> str:
+    """同步获取 token（供 send_group_text 用）。"""
+    return _get_access_token_sync()
+
+
+async def async_send_group_text(
+    chat_id: str,
+    content: str,
+    mentioned_list: Optional[list[str]] = None,
+) -> dict:
+    """异步：获取 token 后调用 appchat/send，供回调后台任务使用。"""
+    token = await asyncio.to_thread(_get_access_token_sync)
     url = f"https://qyapi.weixin.qq.com/cgi-bin/appchat/send?access_token={token}"
     body = {
         "chatid": chat_id,
@@ -55,7 +60,32 @@ def send_group_text(chat_id: str, content: str, mentioned_list: Optional[list[st
             "mentioned_list": mentioned_list or [],
         },
     }
+    headers = {"Content-Type": "application/json; charset=utf-8"}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(url, json=body, headers=headers)
+        r.raise_for_status()
+        return r.json()
+
+
+def send_group_text(chat_id: str, content: str, mentioned_list: Optional[list[str]] = None) -> dict:
+    """
+    应用推送文本消息到群聊（同步）。
+    chat_id: 群聊 ID（从回调 ChatId 获取）
+    content: 文本内容
+    mentioned_list: 要 @ 的成员 userid 列表，可选
+    """
+    token = _get_access_token_sync()
+    url = f"https://qyapi.weixin.qq.com/cgi-bin/appchat/send?access_token={token}"
+    body = {
+        "chatid": chat_id,
+        "msgtype": "text",
+        "text": {
+            "content": content,
+            "mentioned_list": mentioned_list or [],
+        },
+    }
+    headers = {"Content-Type": "application/json; charset=utf-8"}
     with httpx.Client(timeout=10.0) as client:
-        r = client.post(url, json=body)
+        r = client.post(url, json=body, headers=headers)
         r.raise_for_status()
         return r.json()

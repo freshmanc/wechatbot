@@ -1,6 +1,7 @@
 """
-Chroma 向量存储（Demo 快，无需 Postgres 扩展）。
+Chroma 向量存储。支持持久化目录，重启不丢索引。
 """
+from pathlib import Path
 from typing import List, Tuple
 
 import chromadb
@@ -15,7 +16,13 @@ _client = None
 def _get_client():
     global _client
     if _client is None:
-        _client = chromadb.Client(ChromaSettings(anonymized_telemetry=False))
+        s = get_settings()
+        if s.chroma_persist_dir:
+            path = Path(s.chroma_persist_dir).resolve()
+            path.mkdir(parents=True, exist_ok=True)
+            _client = chromadb.PersistentClient(path=str(path), settings=ChromaSettings(anonymized_telemetry=False))
+        else:
+            _client = chromadb.Client(ChromaSettings(anonymized_telemetry=False))
     return _client
 
 

@@ -21,7 +21,10 @@ async def chat_completion(
     s = get_settings()
     model = model or s.llm_model
     timeout = timeout_sec if timeout_sec is not None else s.llm_timeout_sec
-    client = AsyncOpenAI(api_key=s.openai_api_key)
+    kwargs = {"api_key": s.openai_api_key or "sk-dummy"}
+    if s.openai_base_url:
+        kwargs["base_url"] = s.openai_base_url.rstrip("/")
+    client = AsyncOpenAI(**kwargs)
 
     try:
         response = await asyncio.wait_for(
@@ -53,7 +56,10 @@ async def chat_completion_stream(
     s = get_settings()
     model = model or s.llm_model
     timeout = timeout_sec if timeout_sec is not None else s.llm_timeout_sec
-    client = AsyncOpenAI(api_key=s.openai_api_key)
+    kwargs = {"api_key": s.openai_api_key or "sk-dummy"}
+    if s.openai_base_url:
+        kwargs["base_url"] = s.openai_base_url.rstrip("/")
+    client = AsyncOpenAI(**kwargs)
 
     try:
         stream = await asyncio.wait_for(

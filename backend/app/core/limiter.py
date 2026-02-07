@@ -1,24 +1,32 @@
 """
 基于 Redis 的每日限额：用户/群/全局。
 Key: user:{user_id}:{yyyyMMdd}, group:{group_id}:{yyyyMMdd}, global:{yyyyMMdd}
+Redis 未安装或不可用时跳过限额（便于本地仅测 LLM）。
 """
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Any
 
-import redis.asyncio as aioredis
+try:
+    import redis.asyncio as aioredis
+except ImportError:
+    aioredis = None  # type: ignore
 
 from app.config import get_settings
 from app.core.errors import LimitExceededError
 
-# 单例连接（按需可改为依赖注入）
-_redis: Optional[aioredis.Redis] = None
+_redis: Optional[Any] = None
 
 
-async def get_redis() -> aioredis.Redis:
+async def get_redis() -> Optional[Any]:
     global _redis
+    if aioredis is None:
+        return None
     if _redis is None:
-        s = get_settings()
-        _redis = aioredis.from_url(s.redis_url, decode_responses=True)
+        try:
+            s = get_settings()
+            _redis = aioredis.from_url(s.redis_url, decode_responses=True)
+        except Exception:
+            return None
     return _redis
 
 
@@ -29,6 +37,8 @@ def _date_suffix() -> str:
 async def check_and_incr_user(user_id: str) -> None:
     """检查用户当日次数并 +1，超限抛 LimitExceededError。"""
     r = await get_redis()
+    if r is None:
+        return
     s = get_settings()
     key = f"user:{user_id}:{_date_suffix()}"
     count = await r.incr(key)
@@ -42,6 +52,8 @@ async def check_and_incr_user(user_id: str) -> None:
 async def check_and_incr_group(group_id: str) -> None:
     """检查群当日次数并 +1。"""
     r = await get_redis()
+    if r is None:
+        return
     s = get_settings()
     key = f"group:{group_id}:{_date_suffix()}"
     count = await r.incr(key)
@@ -55,6 +67,8 @@ async def check_and_incr_group(group_id: str) -> None:
 async def check_and_incr_global() -> None:
     """检查全局当日次数并 +1。"""
     r = await get_redis()
+    if r is None:
+        return
     s = get_settings()
     key = f"global:{_date_suffix()}"
     count = await r.incr(key)
@@ -66,8 +80,11 @@ async def check_and_incr_global() -> None:
 
 
 async def check_limits_and_incr(user_id: str, group_id: Optional[str] = None) -> None:
-    """先检查全局、再群、再用户，任一超限即抛异常；全部通过则三者均 +1。"""
-    await check_and_incr_global()
-    if group_id:
-        await check_and_incr_group(group_id)
-    await check_and_incr_user(user_id)
+    """先检查全局、再群、再用户，任一超限即抛异常；全部通过则三者均 +1。Redis 不可用时跳过限额（便于本地无 Docker 测试）。"""
+    try:
+        await check_and_incr_global()
+        if group_id:
+            await check_and_incr_group(group_id)
+        await check_and_incr_user(user_id)
+    except Exception:
+        pass  # Redis 未启动时跳过限额

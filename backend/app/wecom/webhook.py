@@ -1,19 +1,37 @@
 """
 POST /wecom/callback 接收企业微信回调。
-验签 → 解密 → 解析 XML（MsgType/Content/群聊ID/发送者）→ 仅处理群聊且 @ 机器人的文本 → 调用问答 → 加密回复。
+验签 → 解密 → 解析 XML → 仅当明确 @ 机器人时才触发 → 立即返回 success → 后台调问答并 appchat/send 发群消息。
 """
 import re
 import xml.etree.ElementTree as ET
 from typing import Optional
 
-from fastapi import APIRouter, Request, Query
+from fastapi import APIRouter, BackgroundTasks, Request, Query
 from fastapi.responses import PlainTextResponse
 
 from app.config import get_settings
-from app.wecom.crypto import decrypt, encrypt_reply_xml
+from app.wecom.crypto import decrypt
 from app.wecom.verify import verify_callback_body, verify_url_and_echo
 
 router = APIRouter(prefix="/wecom", tags=["wecom"])
+
+# 回复纯文本时统一使用 UTF-8，避免企业微信或客户端乱码
+TEXT_UTF8_MEDIA_TYPE = "text/plain; charset=utf-8"
+
+
+def _decode_body(raw: bytes) -> str:
+    """解码回调 body：优先 UTF-8，去掉 BOM；失败则试 GBK。"""
+    if not raw:
+        return ""
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            return raw.decode("gbk")
+        except Exception:
+            return raw.decode("utf-8", errors="replace")
 
 
 def _extract_cdata(el: Optional[ET.Element]) -> str:
@@ -38,9 +56,27 @@ def _el_text(root: ET.Element, *tags: str) -> str:
     return ""
 
 
+def _parse_mentioned_list(root: ET.Element) -> list[str]:
+    """解析被 @ 列表。企业微信可能用 MentionedList/MentionedItemList + Item 或 UserID。"""
+    user_ids: list[str] = []
+    for list_tag in ("MentionedList", "MentionedItemList", "mentioned_list"):
+        el = root.find(list_tag) or root.find(list_tag.lower()) or root.find(list_tag.upper())
+        if el is None:
+            continue
+        for item in el.findall("Item") or el.findall("UserID") or el.findall("item") or []:
+            if item.text and item.text.strip():
+                user_ids.append(item.text.strip())
+        # 有的格式是直接在列表标签下多个 UserID
+        for uid in el.findall("UserID") or el.findall("userid") or []:
+            if uid.text and uid.text.strip():
+                user_ids.append(uid.text.strip())
+    return user_ids
+
+
 def _parse_decrypted_msg(xml_str: str) -> dict:
-    """解析解密后的消息 XML，提取 MsgType, Content, FromUserName, ChatId 等。"""
+    """解析解密后的消息 XML，提取 MsgType, Content, FromUserName, ChatId, MentionedList 等。"""
     root = ET.fromstring(xml_str)
+    mentioned = _parse_mentioned_list(root)
     return {
         "msg_type": _el_text(root, "MsgType", "msgtype"),
         "content": _el_text(root, "Content", "content"),
@@ -49,6 +85,7 @@ def _parse_decrypted_msg(xml_str: str) -> dict:
         "msg_id": _el_text(root, "MsgId", "msgid"),
         "agent_id": _el_text(root, "AgentID", "agentid"),
         "chat_id": _el_text(root, "ChatId", "chatid"),
+        "mentioned_list": mentioned,
     }
 
 
@@ -56,10 +93,10 @@ def _normalize_parsed(parsed: dict) -> dict:
     """兼容不同字段名（大小写）。"""
     def get(el, *keys):
         for k in keys:
-            v = (parsed.get(k) or parsed.get(k.lower()) or parsed.get(k.upper()))
+            v = (parsed.get(k) if isinstance(parsed.get(k), list) else parsed.get(k) or parsed.get(k.lower()) or parsed.get(k.upper()))
             if v is not None:
                 return v
-        return ""
+        return "" if keys[0] != "mentioned_list" else []
     return {
         "msg_type": get(parsed, "msg_type", "MsgType"),
         "content": get(parsed, "content", "Content"),
@@ -68,6 +105,7 @@ def _normalize_parsed(parsed: dict) -> dict:
         "msg_id": get(parsed, "msg_id", "MsgId"),
         "agent_id": get(parsed, "agent_id", "AgentID"),
         "chat_id": get(parsed, "chat_id", "ChatId"),
+        "mentioned_list": parsed.get("mentioned_list") if isinstance(parsed.get("mentioned_list"), list) else [],
     }
 
 
@@ -82,29 +120,38 @@ def _is_text_message(parsed: dict) -> bool:
 
 def _extract_question_and_should_reply(
     content: str,
-    bot_user_id: Optional[str] = None,
-    at_bot_pattern: Optional[str] = None,
+    mentioned_list: list[str],
+    bot_user_id: str = "",
+    bot_name: str = "",
 ) -> tuple[str, bool]:
     """
-    判断是否 @ 机器人并提取纯问题文本。
-    企业微信 @ 格式可能为：@机器人名 问题 或 问题中带 @。
-    若未配置 bot_user_id，可用关键字触发（如「问」开头或整句作为问题）。
+    仅当「明确 @ 机器人」时才响应。
+    规则：1）回调带 MentionedList 且 bot_user_id 在列表中；或
+         2）内容包含 <@...>（任一 @）；或
+         3）内容以 @机器人名 开头。
+    否则一律不触发，避免群里任意一句话都回复。
     """
     text = (content or "").strip()
     if not text:
         return "", False
 
-    # 常见 @ 格式：<@userid> 或 @用户名
+    # 1）官方 @ 列表：若配置了 bot_user_id 且其在 mentioned_list 中，则触发
+    if bot_user_id and mentioned_list and bot_user_id in mentioned_list:
+        pass  # 下面统一做 strip @ 后取问题
+    # 2）内容含 <@...>（企业微信常见格式）
+    elif re.search(r"<@[^>]+>", content or ""):
+        pass
+    # 3）以 @机器人名 开头
+    elif bot_name and (content or "").strip().startswith("@" + bot_name):
+        pass
+    else:
+        return "", False
+
+    # 去掉 @ 相关片段，得到纯问题
     at_mention = re.compile(r"@[^\s\u2005]+|\s*<@[^>]+>\s*")
     stripped = at_mention.sub(" ", text).strip()
-    # 若去掉 @ 后为空，说明只是 @ 没有实质问题
     if not stripped:
         return "", False
-
-    # 若配置了必须 @ 才回复：这里简化处理为「内容中包含 @ 或关键字」即视为触发
-    if at_bot_pattern and not re.search(at_bot_pattern, content):
-        return "", False
-
     return stripped, True
 
 
@@ -127,69 +174,35 @@ async def wecom_verify_url(
             nonce,
             echostr,
         )
-        return PlainTextResponse(echo)
+        return PlainTextResponse(echo, media_type=TEXT_UTF8_MEDIA_TYPE)
     except Exception as e:
-        return PlainTextResponse(str(e), status_code=400)
+        return PlainTextResponse(str(e), status_code=400, media_type=TEXT_UTF8_MEDIA_TYPE)
 
 
-@router.post("/callback", response_class=PlainTextResponse)
-async def wecom_callback(request: Request):
-    """
-    接收企业微信 POST 回调：验签、解密、只处理群聊文本且 @ 机器人的消息，
-    调用内部 /v1/chat/ask，再加密回复到群。
-    """
-    s = get_settings()
-    body = (await request.body()).decode("utf-8")
-    msg_signature = request.query_params.get("msg_signature", "")
-    timestamp = request.query_params.get("timestamp", "")
-    nonce = request.query_params.get("nonce", "")
-
-    try:
-        msg_encrypt = _parse_encrypt_body(body)
-    except Exception as e:
-        return PlainTextResponse(f"parse body error: {e}", status_code=400)
-
-    if not verify_callback_body(s.wecom_token, timestamp, nonce, msg_encrypt, msg_signature):
-        return PlainTextResponse("invalid signature", status_code=403)
-
-    try:
-        plain_xml = decrypt(s.wecom_aes_key, msg_encrypt, s.wecom_corp_id)
-    except Exception as e:
-        return PlainTextResponse(f"decrypt error: {e}", status_code=400)
-
-    try:
-        parsed = _parse_decrypted_msg(plain_xml)
-        parsed = _normalize_parsed(parsed)
-    except Exception as e:
-        return PlainTextResponse(f"parse msg error: {e}", status_code=400)
-
-    if not _is_group_message(parsed):
-        return PlainTextResponse("ok")  # 非群聊不处理，直接 200
-
-    if not _is_text_message(parsed):
-        return PlainTextResponse("ok")
-
-    question, should_reply = _extract_question_and_should_reply(parsed["content"])
-    if not should_reply or not question:
-        return PlainTextResponse("ok")
-
-    # 调用内部问答接口（同步 HTTP 调用自身）
+async def _reply_in_background(
+    base_url: str,
+    chat_id: str,
+    from_user_id: str,
+    question: str,
+    msg_id: str,
+):
+    """后台：调 /v1/chat/ask，再用 appchat/send 发群消息（可 @ 提问者）。"""
     import httpx
-    base_url = str(request.base_url).rstrip("/")
-    chat_url = f"{base_url}/v1/chat/ask"
+    from app.wecom.sender import async_send_group_text
+    chat_url = f"{base_url.rstrip('/')}/v1/chat/ask"
     payload = {
         "platform": "wecom",
-        "group_id": parsed.get("chat_id") or f"wecom_room_{parsed.get('msg_id', '')}",
-        "user_id": parsed.get("from_user") or "unknown",
+        "group_id": chat_id,
+        "user_id": from_user_id,
         "text": question,
-        "domain": "montreal_realestate",  # 默认领域，可后续从群/配置映射
-        "conversation_id": parsed.get("msg_id"),
+        "domain": "montreal_realestate",
+        "conversation_id": msg_id,
     }
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
             r = await client.post(chat_url, json=payload)
-            data = r.json()
-    except Exception as e:
+            data = r.json() if r.status_code == 200 else {}
+    except Exception:
         reply_text = "服务暂时不可用，请稍后再试。"
     else:
         if r.status_code == 200 and isinstance(data, dict):
@@ -200,24 +213,69 @@ async def wecom_callback(request: Request):
                 reply_text = reply_text or "服务繁忙，请稍后再试。"
         else:
             reply_text = "处理出错，请稍后再试。"
+    try:
+        await async_send_group_text(chat_id, reply_text, mentioned_list=[from_user_id])
+    except Exception:
+        pass  # 可记日志
 
-    # 被动回复：加密 XML 返回
-    import time
-    reply_ts = str(int(time.time()))
-    reply_nonce = str(int(time.time() * 1000))
-    reply_xml = f"""<xml>
-<ToUserName><![CDATA[{parsed.get("from_user", "")}]]></ToUserName>
-<FromUserName><![CDATA[{parsed.get("to_user", "")}]]></FromUserName>
-<CreateTime>{reply_ts}</CreateTime>
-<MsgType><![CDATA[text]]></MsgType>
-<Content><![CDATA[{reply_text}]]></Content>
-</xml>"""
-    encrypted = encrypt_reply_xml(
-        s.wecom_token,
-        s.wecom_aes_key,
-        s.wecom_corp_id,
-        reply_xml,
-        reply_ts,
-        reply_nonce,
+
+@router.post("/callback", response_class=PlainTextResponse)
+async def wecom_callback(request: Request, background_tasks: BackgroundTasks):
+    """
+    验签、解密、仅当群聊且明确 @ 机器人时投递后台任务，立即返回 success，避免回调超时与重试。
+    """
+    s = get_settings()
+    raw = await request.body()
+    body = _decode_body(raw)
+    msg_signature = request.query_params.get("msg_signature", "")
+    timestamp = request.query_params.get("timestamp", "")
+    nonce = request.query_params.get("nonce", "")
+
+    try:
+        msg_encrypt = _parse_encrypt_body(body)
+    except Exception as e:
+        return PlainTextResponse(f"parse body error: {e}", status_code=400, media_type=TEXT_UTF8_MEDIA_TYPE)
+
+    if not verify_callback_body(s.wecom_token, timestamp, nonce, msg_encrypt, msg_signature):
+        return PlainTextResponse("invalid signature", status_code=403, media_type=TEXT_UTF8_MEDIA_TYPE)
+
+    try:
+        plain_xml = decrypt(s.wecom_aes_key, msg_encrypt, s.wecom_corp_id)
+    except Exception as e:
+        return PlainTextResponse(f"decrypt error: {e}", status_code=400, media_type=TEXT_UTF8_MEDIA_TYPE)
+
+    try:
+        parsed = _parse_decrypted_msg(plain_xml)
+        parsed = _normalize_parsed(parsed)
+    except Exception as e:
+        return PlainTextResponse(f"parse msg error: {e}", status_code=400, media_type=TEXT_UTF8_MEDIA_TYPE)
+
+    if not _is_group_message(parsed):
+        return PlainTextResponse("success", media_type=TEXT_UTF8_MEDIA_TYPE)
+    if not _is_text_message(parsed):
+        return PlainTextResponse("success", media_type=TEXT_UTF8_MEDIA_TYPE)
+
+    mentioned_list = parsed.get("mentioned_list") or []
+    if not isinstance(mentioned_list, list):
+        mentioned_list = []
+    question, should_reply = _extract_question_and_should_reply(
+        parsed["content"],
+        mentioned_list=mentioned_list,
+        bot_user_id=s.wecom_bot_user_id or "",
+        bot_name=(s.wecom_bot_name or "").strip(),
     )
-    return PlainTextResponse(encrypted, media_type="application/xml")
+    if not should_reply or not question:
+        return PlainTextResponse("success", media_type=TEXT_UTF8_MEDIA_TYPE)
+
+    chat_id = parsed.get("chat_id") or f"wecom_room_{parsed.get('msg_id', '')}"
+    from_user = parsed.get("from_user") or "unknown"
+    base_url = str(request.base_url).rstrip("/")
+    background_tasks.add_task(
+        _reply_in_background,
+        base_url,
+        chat_id,
+        from_user,
+        question,
+        parsed.get("msg_id") or "",
+    )
+    return PlainTextResponse("success", media_type=TEXT_UTF8_MEDIA_TYPE)
