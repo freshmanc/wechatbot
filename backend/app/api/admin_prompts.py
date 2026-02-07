@@ -1,8 +1,8 @@
 """管理端：Prompt 版本管理。"""
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
-from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, update  # pyright: ignore[reportMissingImports]
+from sqlalchemy.ext.asyncio import AsyncSession  # pyright: ignore[reportMissingImports]
 
 from app.db.models import PromptVersion as PromptVersionModel
 from app.db.session import get_db

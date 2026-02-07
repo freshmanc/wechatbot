@@ -19,7 +19,7 @@ def verify_url_and_echo(
     校验 URL 时企业微信会带 echostr（已加密）。
     验签后解密 echostr，原样返回明文即通过校验。
     """
-    if not verify_signature(token, timestamp, nonce, echostr):
+    if not verify_signature(token, timestamp, nonce, echostr, msg_signature):
         raise ValueError("URL 校验签名失败")
     return decrypt(encoding_aes_key, echostr, corp_id)
 

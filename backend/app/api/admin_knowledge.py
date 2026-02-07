@@ -1,8 +1,8 @@
 """管理端：知识上传、启停、标签。"""
 from fastapi import APIRouter, Depends, File, UploadFile
 from pydantic import BaseModel
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select  # pyright: ignore[reportMissingImports]
+from sqlalchemy.ext.asyncio import AsyncSession  # pyright: ignore[reportMissingImports]
 
 from app.db.models import Document
 from app.db.session import get_db
@@ -71,7 +71,7 @@ async def update_document(
     db: AsyncSession = Depends(get_db),
 ):
     """启停/标签。"""
-    from sqlalchemy import update
+    from sqlalchemy import update  # pyright: ignore[reportMissingImports]
     doc_id_int = int(doc_id)
     upd = {}
     if enabled is not None:

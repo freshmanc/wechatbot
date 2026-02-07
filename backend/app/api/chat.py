@@ -45,6 +45,8 @@ class AskResponse(BaseModel):
 
 # 兜底文案（LLM 超时或异常时返回）
 FALLBACK_ANSWER = "服务繁忙，请稍后再试。"
+# 超限时统一返回 200 + 此文案，便于 WeCom 等回调正确展示「今日次数已达上限」
+LIMIT_EXCEEDED_ANSWER = "今日提问次数已达上限，明天再试哦。"
 
 
 @router.post("/chat/ask", response_model=AskResponse)
@@ -53,11 +55,16 @@ async def chat_ask(req: AskRequest) -> AskResponse:
     flags: dict[str, bool] = {"limited": False, "fallback": False}
     start = time.perf_counter()
 
-    # 限额
+    # 限额：超限时返回 200 + flags.limited，不抛 429，便于 WeCom 回调正确提示用户
     try:
         await check_limits_and_incr(req.user_id, req.group_id)
-    except LimitExceededError as e:
-        raise HTTPException(status_code=429, detail={"code": e.code, "message": e.message})
+    except LimitExceededError:
+        return AskResponse(
+            request_id=request_id,
+            answer=LIMIT_EXCEEDED_ANSWER,
+            citations=[],
+            flags={"limited": True, "fallback": False},
+        )
 
     # 领域
     if not is_allowed_domain(req.domain):
@@ -65,10 +72,10 @@ async def chat_ask(req: AskRequest) -> AskResponse:
 
     # RAG：检索 + 生成（若未实现 RAG 则直接走 LLM 或固定回复）
     answer = ""
-    citations: list[Citation] = []
+    citations_raw: list[dict[str, Any]] = []
     try:
         from app.rag.runtime.answer import answer_with_rag
-        answer, citations, flags["fallback"] = await answer_with_rag(
+        answer, citations_raw, flags["fallback"] = await answer_with_rag(
             question=req.text,
             domain=req.domain,
             conversation_id=req.conversation_id,
@@ -104,7 +111,7 @@ async def chat_ask(req: AskRequest) -> AskResponse:
                     domain=req.domain,
                     question=req.text,
                     answer=answer,
-                    citations_json=json.dumps([c.get("source") for c in (citations if isinstance(citations, list) else [])], ensure_ascii=False),
+                    citations_json=json.dumps([c.get("source") for c in citations_raw], ensure_ascii=False),
                     elapsed_ms=round(elapsed_ms, 2),
                     token_used=None,
                     fallback=flags.get("fallback", False),
@@ -115,12 +122,13 @@ async def chat_ask(req: AskRequest) -> AskResponse:
     except Exception:
         pass  # 无数据库时跳过日志，不影响返回
 
+    citations: list[Citation] = [
+        Citation(source=c.get("source", ""), title=c.get("title"), chunk_id=c.get("chunk_id"))
+        for c in citations_raw
+    ]
     return AskResponse(
         request_id=request_id,
         answer=answer,
-        citations=[
-            Citation(source=c.get("source", ""), title=c.get("title"), chunk_id=c.get("chunk_id"))
-            for c in (citations if isinstance(citations, list) else [])
-        ],
+        citations=citations,
         flags=flags,
     )

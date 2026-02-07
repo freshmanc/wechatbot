@@ -1,8 +1,27 @@
 """
 POST /wecom/callback 接收企业微信回调。
 验签 → 解密 → 解析 XML → 仅当明确 @ 机器人时才触发 → 立即返回 success → 后台调问答并 appchat/send 发群消息。
+
+联调三关（A/B/C）及必备点：
+
+A. URL 验证（GET 校验）
+  - 逻辑：验签并解密 echostr 后原样返回（verify.py → webhook PlainTextResponse）。
+  - 回调地址必须 443/标准 HTTPS；非 443 或弱证书/自签/不完整链可能导致企业微信校验失败。
+  - 服务器时间需基本准确（NTP），否则签名校验可能因 timestamp 偏差失败。
+
+B. 仅 @ 时触发
+  - 触发规则三选一：MentionedList 含 bot_user_id / 内容含 <@...> / 以 @机器人名 开头。
+  - 兜底过滤：只处理群聊、只处理文本消息；去掉 @ 后若文本为空（例如只@不问）则不回复。
+  - 日志会输出解析到的 MentionedList 与 content 预览（脱敏），便于区分「字段未带」与「正则未匹配」。
+
+C. 主动发群消息（gettoken + appchat/send）
+  - token 缓存：gettoken 有频率限制，当前实现缓存约 7200s 并提前 60s 刷新，避免高频失败。
+  - 幂等去重：企业微信回调会重试，已用 Redis SETNX wecom:dedupe:{msg_id} 仅首次处理，防刷屏。
+  - 发送失败兜底：errcode≠0 或异常时日志带 trace_id/msg_id/chat_id/from_user 便于追踪。
 """
+import logging
 import re
+import uuid
 import xml.etree.ElementTree as ET
 from typing import Optional
 
@@ -10,8 +29,14 @@ from fastapi import APIRouter, BackgroundTasks, Request, Query
 from fastapi.responses import PlainTextResponse
 
 from app.config import get_settings
+from app.core.limiter import get_redis
 from app.wecom.crypto import decrypt
 from app.wecom.verify import verify_callback_body, verify_url_and_echo
+
+logger = logging.getLogger(__name__)
+
+# 幂等去重 key 过期时间（企业微信重试窗口）
+DEDUPE_TTL_SEC = 86400 * 2  # 2 天
 
 router = APIRouter(prefix="/wecom", tags=["wecom"])
 
@@ -35,7 +60,9 @@ def _decode_body(raw: bytes) -> str:
 
 
 def _extract_cdata(el: Optional[ET.Element]) -> str:
-    if el is None or el.text:
+    if el is None:
+        return ""
+    if el.text:
         return (el.text or "").strip()
     return (el.text or "") + "".join(ET.tostring(e, encoding="unicode", method="xml") for e in el)
 
@@ -185,9 +212,10 @@ async def _reply_in_background(
     from_user_id: str,
     question: str,
     msg_id: str,
+    trace_id: str,
 ):
     """后台：调 /v1/chat/ask，再用 appchat/send 发群消息（可 @ 提问者）。"""
-    import httpx
+    import httpx  # pyright: ignore[reportMissingImports]
     from app.wecom.sender import async_send_group_text
     chat_url = f"{base_url.rstrip('/')}/v1/chat/ask"
     payload = {
@@ -214,9 +242,17 @@ async def _reply_in_background(
         else:
             reply_text = "处理出错，请稍后再试。"
     try:
-        await async_send_group_text(chat_id, reply_text, mentioned_list=[from_user_id])
-    except Exception:
-        pass  # 可记日志
+        res = await async_send_group_text(chat_id, reply_text, mentioned_list=[from_user_id])
+        if res.get("errcode") != 0:
+            logger.warning(
+                "wecom send group reply failed trace_id=%s msg_id=%s chat_id=%s from_user=%s errcode=%s errmsg=%s",
+                trace_id, msg_id, chat_id, from_user_id, res.get("errcode"), res.get("errmsg"),
+            )
+    except Exception as e:
+        logger.exception(
+            "wecom send group reply exception trace_id=%s msg_id=%s chat_id=%s from_user=%s error=%s",
+            trace_id, msg_id, chat_id, from_user_id, e,
+        )
 
 
 @router.post("/callback", response_class=PlainTextResponse)
@@ -267,15 +303,36 @@ async def wecom_callback(request: Request, background_tasks: BackgroundTasks):
     if not should_reply or not question:
         return PlainTextResponse("success", media_type=TEXT_UTF8_MEDIA_TYPE)
 
-    chat_id = parsed.get("chat_id") or f"wecom_room_{parsed.get('msg_id', '')}"
+    # 脱敏日志：便于区分「MentionedList 未带」与「正则未匹配」
+    content_preview = ((parsed.get("content") or "")[:80]).strip()
+    logger.info(
+        "wecom trigger reply mentioned_list=%s content_preview=%s",
+        mentioned_list,
+        content_preview if content_preview else "(empty)",
+    )
+
+    msg_id = parsed.get("msg_id") or ""
+    # 幂等去重：企业微信重试会导致重复回复，用 Redis SETNX 仅首次处理
+    if msg_id:
+        r = await get_redis()
+        if r is not None:
+            dedupe_key = f"wecom:dedupe:{msg_id}"
+            ok = await r.set(dedupe_key, "1", nx=True)
+            if not ok:
+                return PlainTextResponse("success", media_type=TEXT_UTF8_MEDIA_TYPE)
+            await r.expire(dedupe_key, DEDUPE_TTL_SEC)
+
+    chat_id = parsed.get("chat_id") or f"wecom_room_{msg_id or 'unknown'}"
     from_user = parsed.get("from_user") or "unknown"
     base_url = str(request.base_url).rstrip("/")
+    trace_id = str(uuid.uuid4())
     background_tasks.add_task(
         _reply_in_background,
         base_url,
         chat_id,
         from_user,
         question,
-        parsed.get("msg_id") or "",
+        msg_id,
+        trace_id,
     )
     return PlainTextResponse("success", media_type=TEXT_UTF8_MEDIA_TYPE)

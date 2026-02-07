@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Optional, Any
 
 try:
-    import redis.asyncio as aioredis
+    import redis.asyncio as aioredis  # pyright: ignore[reportMissingImports]
 except ImportError:
     aioredis = None  # type: ignore
 
@@ -80,11 +80,13 @@ async def check_and_incr_global() -> None:
 
 
 async def check_limits_and_incr(user_id: str, group_id: Optional[str] = None) -> None:
-    """先检查全局、再群、再用户，任一超限即抛异常；全部通过则三者均 +1。Redis 不可用时跳过限额（便于本地无 Docker 测试）。"""
+    """先检查全局、再群、再用户，任一超限即抛 LimitExceededError；全部通过则三者均 +1。Redis 不可用时跳过限额。"""
     try:
         await check_and_incr_global()
         if group_id:
             await check_and_incr_group(group_id)
         await check_and_incr_user(user_id)
+    except LimitExceededError:
+        raise
     except Exception:
-        pass  # Redis 未启动时跳过限额
+        pass  # Redis 未启动/连接失败时跳过限额
